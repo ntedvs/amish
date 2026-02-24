@@ -90,6 +90,59 @@ func decodeString(br *bufio.Reader) (any, error) {
 
 func decodeList(br *bufio.Reader) (any, error) {
 	br.ReadByte()
+	list := make([]any, 0)
+
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		if b == 'e' {
+			break
+		}
+
+		br.UnreadByte()
+
+		a, err := decode(br)
+		if err != nil {
+			return nil, err
+		}
+
+		list = append(list, a)
+	}
+
+	return list, nil
 }
 
-func decodeDict(br *bufio.Reader) (any, error) {}
+func decodeDict(br *bufio.Reader) (any, error) {
+	br.ReadByte()
+	dict := make(map[string]any)
+
+	for {
+		k, err := br.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		if k == 'e' {
+			break
+		}
+
+		br.UnreadByte()
+
+		a, err := decode(br)
+		if err != nil {
+			return nil, err
+		}
+
+		b, err := decode(br)
+		if err != nil {
+			return nil, err
+		}
+
+		dict[a.(string)] = b
+	}
+
+	return dict, nil
+}
