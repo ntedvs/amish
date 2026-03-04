@@ -54,7 +54,7 @@ func main() {
 		t.Info.Name, t.Info.NumPieces(), torrent.FormatBytes(t.Info.TotalLength()))
 
 	// Phase 2: download with progress display.
-	// Silence log output during download — display handles it.
+	// Silence logs so they don't interfere with the progress bar.
 	t.Log = func(string, ...any) {}
 
 	disp := display.New(&t.Stats, display.TruncateName(name, 30))

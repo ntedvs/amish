@@ -6,10 +6,17 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"amish/peer"
 )
+
+var pieceBufferPool = sync.Pool{
+	New: func() interface{} {
+		return nil
+	},
+}
 
 var (
 	ErrChoked    = errors.New("choked")
@@ -38,19 +45,37 @@ const MaxPieceTries = 5
 // and verifies the SHA1 hash. Returns ErrChoked if the peer chokes us
 // (caller should wait for unchoke and retry, not abandon the connection).
 func DownloadPiece(conn *peer.Conn, pw *PieceWork) PieceResult {
-	// Per-piece deadline -- 30s or 5s per block, whichever is larger.
+	// Per-piece deadline -- 10s or 5s per block, whichever is larger.
 	numBlocks := (int(pw.Length) + peer.BlockSize - 1) / peer.BlockSize
 	timeout := time.Duration(numBlocks*5) * time.Second
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	buf := make([]byte, pw.Length)
+	bufIface := pieceBufferPool.Get()
+	var buf []byte
+	if bufIface != nil {
+		buf = bufIface.([]byte)
+		if cap(buf) >= int(pw.Length) {
+			buf = buf[:pw.Length]
+		} else {
+			buf = make([]byte, pw.Length)
+		}
+	} else {
+		buf = make([]byte, pw.Length)
+	}
+	returnToPool := true
+	defer func() {
+		if returnToPool {
+			pieceBufferPool.Put(buf[:0])
+		}
+	}()
+
 	downloaded := 0
 	requested := 0
 	backlog := 0
-	maxBacklog := 5 // pipelined requests
+	maxBacklog := 16 // pipelined requests
 
 	for downloaded < int(pw.Length) {
 		// Send requests until we hit the backlog limit.
@@ -110,6 +135,7 @@ func DownloadPiece(conn *peer.Conn, pw *PieceWork) PieceResult {
 		return PieceResult{Index: pw.Index, Err: fmt.Errorf("hash mismatch for piece %d", pw.Index)}
 	}
 
+	returnToPool = false
 	return PieceResult{Index: pw.Index, Data: buf}
 }
 
