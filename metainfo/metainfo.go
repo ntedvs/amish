@@ -117,18 +117,27 @@ func ParseUnverified(raw []byte) (*Info, error) {
 	if length, ok := dict["length"].(int64); ok {
 		info.Length = length
 	} else if files, ok := dict["files"].([]any); ok {
-		for _, f := range files {
+		for i, f := range files {
 			fd, ok := f.(map[string]any)
 			if !ok {
-				continue
+				return nil, fmt.Errorf("%w: file entry %d is not a dict", ErrInvalidMetadata, i)
 			}
-			fl, _ := fd["length"].(int64)
-			pathList, _ := fd["path"].([]any)
+			fl, ok := fd["length"].(int64)
+			if !ok {
+				return nil, fmt.Errorf("%w: file entry %d missing length", ErrInvalidMetadata, i)
+			}
+			pathList, ok := fd["path"].([]any)
+			if !ok || len(pathList) == 0 {
+				return nil, fmt.Errorf("%w: file entry %d missing path", ErrInvalidMetadata, i)
+			}
 			var path []string
 			for _, p := range pathList {
 				if s, ok := p.(string); ok {
 					path = append(path, s)
 				}
+			}
+			if len(path) == 0 {
+				return nil, fmt.Errorf("%w: file entry %d has empty path", ErrInvalidMetadata, i)
 			}
 			info.Files = append(info.Files, File{Length: fl, Path: path})
 		}

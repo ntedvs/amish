@@ -6,12 +6,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 	"time"
 
 	"amish/bencode"
+	"amish/netaddr"
 )
 
 const (
@@ -22,6 +22,8 @@ const (
 var (
 	ErrInvalidPeerID = errors.New("dht: invalid peer id")
 	ErrBadResponse   = errors.New("dht: bad response")
+	ErrTimeout       = errors.New("dht: timeout")
+	ErrNotListening  = errors.New("dht: not listening")
 )
 
 type QueryType string
@@ -40,19 +42,16 @@ const (
 	MsgError MsgType = "e"
 )
 
-type Peer struct {
-	IP   string
-	Port int
-}
-
-func (p Peer) Addr() string {
-	return fmt.Sprintf("%s:%d", p.IP, p.Port)
-}
+// Peer is a discovered peer address.
+type Peer = netaddr.Peer
 
 type Node struct {
 	ID   [20]byte
 	Addr string
 }
+
+// LogFunc is an optional callback for debug logging.
+type LogFunc func(format string, args ...any)
 
 type Client struct {
 	id        [20]byte
@@ -64,6 +63,8 @@ type Client struct {
 	peersMu   sync.RWMutex
 	queries   map[string]chan map[string]any
 	queriesMu sync.Mutex
+	Log       LogFunc
+	done      chan struct{}
 }
 
 func New() *Client {
@@ -80,6 +81,13 @@ func New() *Client {
 		peers:   make(map[string][]Peer),
 		queries: make(map[string]chan map[string]any),
 		secret:  secret,
+		done:    make(chan struct{}),
+	}
+}
+
+func (c *Client) log(format string, args ...any) {
+	if c.Log != nil {
+		c.Log(format, args...)
 	}
 }
 
@@ -110,20 +118,53 @@ func (c *Client) Addr() string {
 	return c.conn.LocalAddr().String()
 }
 
-func (c *Client) Bootstrap(nodes []string) error {
-	for _, addr := range nodes {
-		c.pingNode(addr)
+// Close shuts down the client, closing the UDP connection and stopping recvLoop.
+func (c *Client) Close() error {
+	select {
+	case <-c.done:
+		return nil // already closed
+	default:
+		close(c.done)
 	}
-	time.Sleep(500 * time.Millisecond)
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+func (c *Client) Bootstrap(nodes []string) error {
+	var lastErr error
+	reachable := 0
+	for _, addr := range nodes {
+		if err := c.pingNode(addr); err != nil {
+			c.log("bootstrap ping %s: %v", addr, err)
+			lastErr = err
+		} else {
+			reachable++
+		}
+	}
+	if reachable == 0 && lastErr != nil {
+		return fmt.Errorf("dht: all bootstrap nodes failed: %w", lastErr)
+	}
 	return nil
 }
 
 func (c *Client) pingNode(addr string) error {
-	id := c.id
-	_, err := c.query(addr, QueryPing, map[string]any{
-		"id": id[:],
+	resp, err := c.query(addr, QueryPing, map[string]any{
+		"id": c.id[:],
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Add the responding node to our routing table.
+	if idStr, ok := resp["id"].(string); ok && len(idStr) == 20 {
+		var nodeID [20]byte
+		copy(nodeID[:], idStr)
+		c.nodesMu.Lock()
+		c.nodes[addr] = Node{ID: nodeID, Addr: addr}
+		c.nodesMu.Unlock()
+	}
+	return nil
 }
 
 func (c *Client) GetPeers(infoHash [20]byte) chan Peer {
@@ -193,8 +234,8 @@ func (c *Client) decodePeers(v any) []Peer {
 	case string:
 		for i := 0; i+6 <= len(s); i += 6 {
 			peers = append(peers, Peer{
-				IP:   net.IP(s[i : i+4]).String(),
-				Port: int(binary.BigEndian.Uint16([]byte(s[i+4 : i+6]))),
+				IP:   net.IP([]byte(s[i : i+4])),
+				Port: binary.BigEndian.Uint16([]byte(s[i+4 : i+6])),
 			})
 		}
 	case []any:
@@ -202,7 +243,7 @@ func (c *Client) decodePeers(v any) []Peer {
 			if m, ok := m.(map[string]any); ok {
 				if ip, ok := m["ip"].(string); ok {
 					if port, ok := m["port"].(int64); ok {
-						peers = append(peers, Peer{IP: ip, Port: int(port)})
+						peers = append(peers, Peer{IP: net.ParseIP(ip), Port: uint16(port)})
 					}
 				}
 			}
@@ -260,13 +301,13 @@ func (c *Client) query(addr string, qtype QueryType, args map[string]any) (map[s
 	case resp := <-respCh:
 		return resp, nil
 	case <-time.After(3 * time.Second):
-		return nil, errors.New("dht: timeout")
+		return nil, ErrTimeout
 	}
 }
 
 func (c *Client) send(addr string, msg map[string]any) error {
 	if c.conn == nil {
-		return errors.New("dht: not listening")
+		return ErrNotListening
 	}
 
 	data, err := bencode.Encode(msg)
@@ -288,11 +329,18 @@ func (c *Client) recvLoop() {
 	for {
 		n, addr, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
-			continue
+			select {
+			case <-c.done:
+				return
+			default:
+				c.log("recv: %v", err)
+				continue
+			}
 		}
 
 		data, err := bencode.Decode(buf[:n])
 		if err != nil {
+			c.log("decode from %s: %v", addr, err)
 			continue
 		}
 
@@ -331,58 +379,90 @@ func (c *Client) handleQuery(addr string, t string, msg map[string]any) {
 	switch QueryType(q) {
 	case QueryPing:
 	case QueryFindNode:
-		if target, ok := args["target"].(string); ok && len(target) == 20 {
-			var tid [20]byte
-			copy(tid[:], target)
-			c.nodesMu.RLock()
-			var closest []Node
-			for _, n := range c.nodes {
-				if distance(n.ID, tid) < math.MaxInt {
-					closest = append(closest, n)
-					if len(closest) >= 8 {
-						break
-					}
-				}
-			}
-			c.nodesMu.RUnlock()
-			if len(closest) > 0 {
-				buf := make([]byte, 0, len(closest)*26)
-				for _, n := range closest {
-					buf = append(buf, n.ID[:]...)
-					ip := net.ParseIP(n.Addr).To4()
-					var port int
-					fmt.Sscanf(n.Addr, "%*s:%d", &port)
-					buf = append(buf, ip...)
-					binary.BigEndian.PutUint16(buf[len(buf)-2:], uint16(port))
-				}
-				resp["r"].(map[string]any)["nodes"] = string(buf)
+		if _, ok := args["target"].(string); ok {
+			closest := c.closestNodes(nil)
+			if encoded := encodeCompactNodes(closest); len(encoded) > 0 {
+				resp["r"].(map[string]any)["nodes"] = string(encoded)
 			}
 		}
 	case QueryGetPeers:
 		if infoHash, ok := args["info_hash"].(string); ok && len(infoHash) == 20 {
-			var ih [20]byte
-			copy(ih[:], infoHash)
 			resp["r"].(map[string]any)["token"] = c.genToken(addr)
-			c.nodesMu.RLock()
-			var nodes []Node
-			for _, n := range c.nodes {
-				if len(nodes) >= 8 {
-					break
+
+			// Return known peers for this info hash if we have them.
+			c.peersMu.RLock()
+			knownPeers := c.peers[infoHash]
+			c.peersMu.RUnlock()
+
+			if len(knownPeers) > 0 {
+				resp["r"].(map[string]any)["values"] = encodePeerList(knownPeers)
+			} else {
+				closest := c.closestNodes(nil)
+				if encoded := encodeCompactNodes(closest); len(encoded) > 0 {
+					resp["r"].(map[string]any)["nodes"] = string(encoded)
 				}
-				nodes = append(nodes, n)
-			}
-			c.nodesMu.RUnlock()
-			if len(nodes) > 0 {
-				buf := make([]byte, 0, len(nodes)*26)
-				for _, n := range nodes {
-					buf = append(buf, n.ID[:]...)
-				}
-				resp["r"].(map[string]any)["nodes"] = string(buf)
 			}
 		}
 	}
 
 	c.send(addr, resp)
+}
+
+// closestNodes returns up to 8 nodes from the routing table.
+// If filter is non-nil, only nodes passing the filter are included.
+func (c *Client) closestNodes(filter func(Node) bool) []Node {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	var nodes []Node
+	for _, n := range c.nodes {
+		if filter != nil && !filter(n) {
+			continue
+		}
+		nodes = append(nodes, n)
+		if len(nodes) >= 8 {
+			break
+		}
+	}
+	return nodes
+}
+
+// encodePeerList encodes peers into BEP 5 compact format (6 bytes each: 4-byte IP + 2-byte port).
+func encodePeerList(peers []Peer) string {
+	buf := make([]byte, 0, len(peers)*6)
+	for _, p := range peers {
+		ip4 := p.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		buf = append(buf, ip4...)
+		var portBuf [2]byte
+		binary.BigEndian.PutUint16(portBuf[:], p.Port)
+		buf = append(buf, portBuf[:]...)
+	}
+	return string(buf)
+}
+
+// encodeCompactNodes encodes nodes into BEP 5 compact format (20-byte ID + 4-byte IP + 2-byte port).
+func encodeCompactNodes(nodes []Node) []byte {
+	buf := make([]byte, 0, len(nodes)*26)
+	for _, n := range nodes {
+		host, portStr, err := net.SplitHostPort(n.Addr)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(host).To4()
+		if ip == nil {
+			continue
+		}
+		var port int
+		fmt.Sscanf(portStr, "%d", &port)
+		buf = append(buf, n.ID[:]...)
+		buf = append(buf, ip...)
+		var portBuf [2]byte
+		binary.BigEndian.PutUint16(portBuf[:], uint16(port))
+		buf = append(buf, portBuf[:]...)
+	}
+	return buf
 }
 
 func (c *Client) handleResponse(t string, msg map[string]any) {
@@ -420,18 +500,6 @@ func sha1Hash(data string) [20]byte {
 	return result
 }
 
-func distance(a, b [20]byte) int {
-	var d int
-	for i := 0; i < 20; i++ {
-		x := a[i] ^ b[i]
-		if x == 0 {
-			continue
-		}
-		d += 20 - i
-		d += 8 - int(math.Log2(float64(x)))
-	}
-	return d
-}
 
 var BootstrapNodes = []string{
 	"router.bittorrent.com:6881",

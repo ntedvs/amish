@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -11,17 +12,22 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: amish <magnet-uri>\n")
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	uri := os.Args[1]
+var errUsage = errors.New("usage: amish <magnet-uri>")
 
-	m, err := magnet.Parse(uri)
+func run(args []string) error {
+	if len(args) < 1 {
+		return errUsage
+	}
+
+	m, err := magnet.Parse(args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "bad magnet link: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("bad magnet link: %w", err)
 	}
 
 	name := m.Name
@@ -35,8 +41,7 @@ func main() {
 
 	cwd, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	t := torrent.New(m, cwd)
@@ -44,17 +49,13 @@ func main() {
 		fmt.Printf(format+"\n", args...)
 	}
 
-	// Phase 1: discover peers + fetch metadata (with log output).
 	if err := t.DiscoverAndFetchMetadata(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("\n%s (%d pieces, %s)\n\n",
-		t.Info.Name, t.Info.NumPieces(), torrent.FormatBytes(t.Info.TotalLength()))
+		t.Info.Name, t.Info.NumPieces(), display.FormatBytes(t.Info.TotalLength()))
 
-	// Phase 2: download with progress display.
-	// Silence logs so they don't interfere with the progress bar.
 	t.Log = func(string, ...any) {}
 
 	disp := display.New(&t.Stats, display.TruncateName(name, 30))
@@ -62,10 +63,10 @@ func main() {
 
 	if err := t.Download(); err != nil {
 		disp.Stop()
-		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	disp.Stop()
 	fmt.Printf("done: %s\n", t.Info.Name)
+	return nil
 }

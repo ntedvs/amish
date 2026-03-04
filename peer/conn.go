@@ -20,8 +20,13 @@ const (
 )
 
 var (
-	ErrBadProtocol = errors.New("peer: invalid protocol string in handshake")
-	ErrBadInfoHash = errors.New("peer: info hash mismatch in handshake")
+	ErrBadProtocol      = errors.New("peer: invalid protocol string in handshake")
+	ErrBadInfoHash      = errors.New("peer: info hash mismatch in handshake")
+	ErrNoExtension      = errors.New("peer: extension not supported")
+	ErrBadExtHandshake  = errors.New("peer: bad extension handshake")
+	ErrNoUtMetadata     = errors.New("peer: remote does not support ut_metadata extension")
+	ErrNoMetadataSize   = errors.New("peer: remote reported zero metadata size")
+	ErrBadMetadataResp  = errors.New("peer: bad metadata response")
 )
 
 // Handshake represents the initial BitTorrent handshake.
@@ -158,12 +163,12 @@ func (c *Conn) SendExtensionHandshake() error {
 func (c *Conn) HandleExtensionHandshake(payload []byte) error {
 	decoded, err := bencode.Decode(payload)
 	if err != nil {
-		return fmt.Errorf("peer: bad extension handshake: %w", err)
+		return fmt.Errorf("%w: %v", ErrBadExtHandshake, err)
 	}
 
 	dict, ok := decoded.(map[string]any)
 	if !ok {
-		return errors.New("peer: extension handshake not a dict")
+		return fmt.Errorf("%w: not a dict", ErrBadExtHandshake)
 	}
 
 	if m, ok := dict["m"].(map[string]any); ok {
@@ -186,7 +191,7 @@ func (c *Conn) HandleExtensionHandshake(payload []byte) error {
 func (c *Conn) RequestMetadataPiece(piece int) error {
 	utMetadata, ok := c.ExtensionIDs["ut_metadata"]
 	if !ok {
-		return errors.New("peer: remote does not support ut_metadata")
+		return ErrNoUtMetadata
 	}
 
 	req := map[string]any{
@@ -218,17 +223,17 @@ func ParseMetadataPiece(payload []byte) (piece int, data []byte, err error) {
 
 	dict, ok := decoded.(map[string]any)
 	if !ok {
-		return 0, nil, errors.New("peer: metadata response not a dict")
+		return 0, nil, fmt.Errorf("%w: not a dict", ErrBadMetadataResp)
 	}
 
 	msgType, ok := dict["msg_type"].(int64)
 	if !ok || msgType != 1 { // 1 = data
-		return 0, nil, fmt.Errorf("peer: metadata msg_type = %v, want 1 (data)", dict["msg_type"])
+		return 0, nil, fmt.Errorf("%w: msg_type = %v, want 1 (data)", ErrBadMetadataResp, dict["msg_type"])
 	}
 
 	pieceVal, ok := dict["piece"].(int64)
 	if !ok {
-		return 0, nil, errors.New("peer: missing piece index")
+		return 0, nil, fmt.Errorf("%w: missing piece index", ErrBadMetadataResp)
 	}
 
 	return int(pieceVal), payload[consumed:], nil

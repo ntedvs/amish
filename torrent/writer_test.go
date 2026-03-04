@@ -117,6 +117,48 @@ func TestPieceSegmentsSingleFile(t *testing.T) {
 	}
 }
 
+func TestWriterBadDirectory(t *testing.T) {
+	info := &metainfo.Info{
+		Name:        "test.bin",
+		PieceLength: 10,
+		Length:      10,
+		Pieces:      make([][20]byte, 1),
+	}
+
+	w := NewWriter(info, "/nonexistent/path/that/should/not/exist")
+	defer w.Close()
+
+	err := w.WritePiece(0, []byte("0123456789"))
+	if err == nil {
+		t.Fatal("expected error writing to nonexistent directory")
+	}
+}
+
+func TestWriterClose(t *testing.T) {
+	dir := t.TempDir()
+	info := &metainfo.Info{
+		Name:        "test.bin",
+		PieceLength: 10,
+		Length:      10,
+		Pieces:      make([][20]byte, 1),
+	}
+
+	w := NewWriter(info, dir)
+	if err := w.WritePiece(0, []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close should succeed.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Double close should be safe (handles already nil).
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPieceSegmentsMultiFile(t *testing.T) {
 	info := &metainfo.Info{
 		Name:        "dir",
@@ -143,20 +185,3 @@ func TestPieceSegmentsMultiFile(t *testing.T) {
 	}
 }
 
-func TestMax64(t *testing.T) {
-	if max64(3, 5) != 5 {
-		t.Fatal("max64(3,5)")
-	}
-	if max64(10, 2) != 10 {
-		t.Fatal("max64(10,2)")
-	}
-}
-
-func TestMin64(t *testing.T) {
-	if min64(3, 5) != 3 {
-		t.Fatal("min64(3,5)")
-	}
-	if min64(10, 2) != 2 {
-		t.Fatal("min64(10,2)")
-	}
-}

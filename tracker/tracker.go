@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"amish/bencode"
+	"amish/netaddr"
 )
 
 var (
@@ -22,16 +23,8 @@ var (
 	ErrUnsupportedProto = errors.New("tracker: unsupported protocol")
 )
 
-// Peer represents a discovered peer address.
-type Peer struct {
-	IP   net.IP
-	Port uint16
-}
-
-// Addr returns the peer address as "ip:port".
-func (p Peer) Addr() string {
-	return net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
-}
+// Peer is a discovered peer address.
+type Peer = netaddr.Peer
 
 // AnnounceParams holds the parameters for a tracker announce.
 type AnnounceParams struct {
@@ -207,12 +200,12 @@ func udpConnectHandshake(conn net.Conn) (uint64, error) {
 
 	action := binary.BigEndian.Uint32(resp[0:4])
 	if action != 0 {
-		return 0, fmt.Errorf("tracker: udp connect action = %d", action)
+		return 0, fmt.Errorf("%w: udp connect action = %d", ErrBadResponse, action)
 	}
 
 	rxTxID := binary.BigEndian.Uint32(resp[4:8])
 	if rxTxID != transactionID {
-		return 0, fmt.Errorf("tracker: udp transaction ID mismatch")
+		return 0, fmt.Errorf("%w: udp transaction ID mismatch", ErrBadResponse)
 	}
 
 	return binary.BigEndian.Uint64(resp[8:16]), nil
@@ -254,7 +247,7 @@ func udpAnnounceRequest(conn net.Conn, connectionID uint64, params AnnounceParam
 
 	action := binary.BigEndian.Uint32(resp[0:4])
 	if action != 1 {
-		return nil, fmt.Errorf("tracker: udp announce action = %d", action)
+		return nil, fmt.Errorf("%w: udp announce action = %d", ErrBadResponse, action)
 	}
 
 	return ParseCompactPeers(resp[20:])

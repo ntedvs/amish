@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"amish/dht"
 	"amish/magnet"
 	"amish/metainfo"
-	"amish/peer"
 	"amish/tracker"
 )
 
@@ -102,19 +100,7 @@ func (t *Torrent) DiscoverAndFetchMetadata() error {
 	dhtPeers := t.discoverDHTPeers()
 	t.Log("found %d peers from DHT", len(dhtPeers))
 
-	allPeers := peers
-	for _, p := range dhtPeers {
-		found := false
-		for _, ep := range peers {
-			if p.Addr() == ep.Addr() {
-				found = true
-				break
-			}
-		}
-		if !found {
-			allPeers = append(allPeers, p)
-		}
-	}
+	allPeers := dedupPeers(peers, dhtPeers)
 
 	t.peers = allPeers
 	t.Log("total peers: %d", len(allPeers))
@@ -134,6 +120,7 @@ func (t *Torrent) discoverDHTPeers() []tracker.Peer {
 		t.Log("DHT listen failed: %v", err)
 		return nil
 	}
+	defer dhtClient.Close()
 	dhtClient.Bootstrap(dht.BootstrapNodes)
 
 	peerCh := dhtClient.GetPeers(t.Magnet.InfoHash)
@@ -146,7 +133,7 @@ func (t *Torrent) discoverDHTPeers() []tracker.Peer {
 			if !ok {
 				return dhtPeers
 			}
-			dhtPeers = append(dhtPeers, tracker.Peer{IP: net.ParseIP(p.IP), Port: uint16(p.Port)})
+			dhtPeers = append(dhtPeers, p)
 		case <-timeout:
 			return dhtPeers
 		}
@@ -162,11 +149,7 @@ func (t *Torrent) Download() error {
 		StartTime:   time.Now(),
 	}
 
-	// Re-announce in the background to find more peers.
-	newPeerCh := make(chan tracker.Peer, 100)
-	go t.reannounceLoop(newPeerCh)
-
-	return t.downloadPieces(t.peers, newPeerCh)
+	return t.downloadPieces(t.peers)
 }
 
 func (t *Torrent) discoverPeers() ([]tracker.Peer, error) {
@@ -203,165 +186,24 @@ func (t *Torrent) discoverPeers() ([]tracker.Peer, error) {
 		allPeers = append(allPeers, r.peers...)
 	}
 
-	// Deduplicate.
-	seen := make(map[string]bool)
-	var unique []tracker.Peer
-	for _, p := range allPeers {
-		addr := p.Addr()
-		if !seen[addr] {
-			seen[addr] = true
-			unique = append(unique, p)
-		}
-	}
-
+	unique := dedupPeers(nil, allPeers)
 	if len(unique) == 0 {
 		return nil, ErrNoPeers
 	}
 	return unique, nil
 }
 
-// metadataPieceSize is the standard size of a BEP 9 metadata piece.
-const metadataPieceSize = 16384
-
-func (t *Torrent) fetchMetadata(peers []tracker.Peer) (*metainfo.Info, error) {
-	type result struct {
-		info *metainfo.Info
-		err  error
-	}
-
-	ctx := make(chan struct{}) // closed when we have a winner
-	resCh := make(chan result, len(peers))
-
-	// Try up to 10 peers concurrently.
-	sem := make(chan struct{}, 10)
-
-	for _, p := range peers {
-		go func(addr string) {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// Bail early if another goroutine already succeeded.
-			select {
-			case <-ctx:
-				return
-			default:
-			}
-
-			t.Log("  trying peer %s for metadata...", addr)
-
-			conn, err := peer.Dial(addr, t.Magnet.InfoHash, t.PeerID, 5*time.Second)
-			if err != nil {
-				resCh <- result{err: err}
-				return
-			}
-			defer conn.Close()
-
-			if !conn.SupportsExtension {
-				resCh <- result{err: errors.New("no extension support")}
-				return
-			}
-
-			if err := conn.SendExtensionHandshake(); err != nil {
-				resCh <- result{err: err}
-				return
-			}
-
-			info, err := t.readMetadataFromPeer(conn)
-			resCh <- result{info: info, err: err}
-		}(p.Addr())
-	}
-
-	for i := 0; i < len(peers); i++ {
-		r := <-resCh
-		if r.err == nil && r.info != nil {
-			close(ctx) // signal others to stop
-			return r.info, nil
-		}
-	}
-
-	return nil, ErrNoMetadata
-}
-
-func (t *Torrent) readMetadataFromPeer(conn *peer.Conn) (*metainfo.Info, error) {
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// Wait for extension handshake.
-	for {
-		msg, err := conn.RecvMessage()
-		if err != nil {
-			return nil, err
-		}
-		if msg == nil {
-			continue
-		}
-		if msg.ID == peer.MsgExtended && len(msg.Payload) > 0 && msg.Payload[0] == 0 {
-			if err := conn.HandleExtensionHandshake(msg.Payload[1:]); err != nil {
-				return nil, err
-			}
-			break
-		}
-	}
-
-	if conn.MetadataSize == 0 {
-		return nil, errors.New("peer did not report metadata_size")
-	}
-
-	// Request all metadata pieces.
-	numPieces := (int(conn.MetadataSize) + metadataPieceSize - 1) / metadataPieceSize
-	metadata := make([]byte, conn.MetadataSize)
-	received := make([]bool, numPieces)
-
-	for i := 0; i < numPieces; i++ {
-		if err := conn.RequestMetadataPiece(i); err != nil {
-			return nil, err
-		}
-	}
-
-	// Collect responses.
-	got := 0
-	for got < numPieces {
-		msg, err := conn.RecvMessage()
-		if err != nil {
-			return nil, err
-		}
-		if msg == nil {
-			continue
-		}
-		if msg.ID != peer.MsgExtended {
-			continue
-		}
-		if len(msg.Payload) < 2 {
-			continue
-		}
-		// Check if this is a ut_metadata message (sub-ID from our extension handshake).
-		subID := msg.Payload[0]
-		if int64(subID) != 1 { // our ut_metadata ID
-			continue
-		}
-
-		piece, data, err := peer.ParseMetadataPiece(msg.Payload[1:])
-		if err != nil {
-			continue
-		}
-
-		if piece < 0 || piece >= numPieces || received[piece] {
-			continue
-		}
-
-		offset := piece * metadataPieceSize
-		copy(metadata[offset:], data)
-		received[piece] = true
-		got++
-	}
-
-	return metainfo.Parse(metadata, t.Magnet.InfoHash)
-}
-
-func (t *Torrent) reannounceLoop(newPeerCh chan<- tracker.Peer) {
+func (t *Torrent) reannounceLoop(newPeerCh chan<- tracker.Peer, doneCh <-chan struct{}) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-doneCh:
+			return
+		case <-ticker.C:
+		}
+
 		params := tracker.AnnounceParams{
 			InfoHash: t.Magnet.InfoHash,
 			PeerID:   t.PeerID,
@@ -373,12 +215,13 @@ func (t *Torrent) reannounceLoop(newPeerCh chan<- tracker.Peer) {
 			go func(url string) {
 				peers, err := tracker.Announce(url, params)
 				if err != nil {
+					t.Log("reannounce %s: %v", url, err)
 					return
 				}
 				for _, p := range peers {
 					select {
 					case newPeerCh <- p:
-					default: // channel full, skip
+					default:
 					}
 				}
 			}(tr)
@@ -386,18 +229,31 @@ func (t *Torrent) reannounceLoop(newPeerCh chan<- tracker.Peer) {
 	}
 }
 
-func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.Peer) error {
-	workCh := make(chan *PieceWork, t.Info.NumPieces())
-	resultCh := make(chan PieceResult)
-	doneCh := make(chan struct{}) // closed when download is complete
+// downloadCtx bundles the channels and trackers shared by all peer workers.
+type downloadCtx struct {
+	workCh   chan *PieceWork
+	resultCh chan PieceResult
+	doneCh   chan struct{} // closed when download is complete
+	endgame  *endgameTracker
+	egCh     chan struct{} // closed when endgame mode activates
+}
 
-	// Endgame: when few pieces remain, all peers race for the same pieces.
-	eg := newEndgameTracker()
-	egCh := make(chan struct{})
+func (t *Torrent) downloadPieces(peers []tracker.Peer) error {
+	ctx := &downloadCtx{
+		workCh:   make(chan *PieceWork, t.Info.NumPieces()),
+		resultCh: make(chan PieceResult),
+		doneCh:   make(chan struct{}),
+		endgame:  newEndgameTracker(),
+		egCh:     make(chan struct{}),
+	}
+
+	// Re-announce in the background to find more peers.
+	newPeerCh := make(chan tracker.Peer, 100)
+	go t.reannounceLoop(newPeerCh, ctx.doneCh)
 
 	// Fill work queue.
 	for i := 0; i < t.Info.NumPieces(); i++ {
-		workCh <- &PieceWork{
+		ctx.workCh <- &PieceWork{
 			Index:  i,
 			Hash:   t.Info.Pieces[i],
 			Length: t.Info.PieceSize(i),
@@ -429,7 +285,7 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 				}
 				workerMu.Unlock()
 			}()
-			t.peerWorker(addr, workCh, resultCh, doneCh, eg, egCh)
+			t.peerWorker(addr, ctx)
 		}()
 	}
 
@@ -445,7 +301,7 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 			select {
 			case p := <-newPeerCh:
 				startWorker(p.Addr(), &wg)
-			case <-doneCh:
+			case <-ctx.doneCh:
 				return
 			}
 		}
@@ -454,7 +310,7 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 	// Close results channel when all workers done.
 	go func() {
 		wg.Wait()
-		close(resultCh)
+		close(ctx.resultCh)
 	}()
 
 	// Collect results.
@@ -463,7 +319,7 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 	done := 0
 	completed := make(map[int]bool)
 
-	for result := range resultCh {
+	for result := range ctx.resultCh {
 		if result.Err != nil {
 			continue
 		}
@@ -473,8 +329,8 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 			continue
 		}
 		completed[result.Index] = true
-		if eg.IsActive() {
-			eg.Complete(result.Index)
+		if ctx.endgame.IsActive() {
+			ctx.endgame.Complete(result.Index)
 		}
 
 		if err := writer.WritePiece(result.Index, result.Data); err != nil {
@@ -486,34 +342,14 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 		atomic.AddInt64(&t.Stats.DownloadedBytes, int64(len(result.Data)))
 
 		if done >= t.Info.NumPieces() {
-			close(doneCh)
+			close(ctx.doneCh)
 			break
 		}
 
 		// Enter endgame when few pieces remain.
 		remaining := t.Info.NumPieces() - done
-		if remaining <= EndgameThreshold && !eg.IsActive() {
-			// Add all uncompleted pieces to the endgame tracker.
-			for i := 0; i < t.Info.NumPieces(); i++ {
-				if !completed[i] {
-					eg.AddPiece(&PieceWork{
-						Index:  i,
-						Hash:   t.Info.Pieces[i],
-						Length: t.Info.PieceSize(i),
-					})
-				}
-			}
-			eg.Activate()
-			// Drain workCh so normal-mode workers unblock and switch.
-		drainLoop:
-			for {
-				select {
-				case <-workCh:
-				default:
-					break drainLoop
-				}
-			}
-			close(egCh)
+		if remaining <= EndgameThreshold && !ctx.endgame.IsActive() {
+			t.transitionToEndgame(ctx, completed)
 		}
 	}
 
@@ -524,188 +360,27 @@ func (t *Torrent) downloadPieces(peers []tracker.Peer, newPeerCh <-chan tracker.
 	return nil
 }
 
-// peerWorker manages a single peer connection. It handles:
-// - Bitfield tracking (only request pieces the peer has)
-// - Choke/unchoke (wait and resume instead of dying)
-// - Reconnection on transient errors
-// - Endgame mode (race with other peers for remaining pieces)
-func (t *Torrent) peerWorker(addr string, workCh chan *PieceWork, resultCh chan<- PieceResult, doneCh <-chan struct{}, eg *endgameTracker, egCh <-chan struct{}) {
-	const maxReconnects = 3
-
-	for attempt := 0; attempt <= maxReconnects; attempt++ {
-		select {
-		case <-doneCh:
-			return
-		default:
-		}
-
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
-		}
-
-		conn, err := peer.Dial(addr, t.Magnet.InfoHash, t.PeerID, 10*time.Second)
-		if err != nil {
-			continue
-		}
-
-		t.runPeerSession(conn, workCh, resultCh, doneCh, eg, egCh)
-		conn.Close()
-	}
-}
-
-func (t *Torrent) runPeerSession(conn *peer.Conn, workCh chan *PieceWork, resultCh chan<- PieceResult, doneCh <-chan struct{}, eg *endgameTracker, egCh <-chan struct{}) {
-	// Initial handshake phase -- 30s to get through bitfield + unchoke.
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// Send interested.
-	if err := conn.SendMessage(peer.NewInterested()); err != nil {
-		return
-	}
-
-	// Read initial messages (bitfield, unchoke).
-	var bitfield peer.Bitfield
-	choked := true
-
-	for {
-		msg, err := conn.RecvMessage()
-		if err != nil {
-			return
-		}
-		if msg == nil {
-			continue
-		}
-		switch msg.ID {
-		case peer.MsgBitfield:
-			bitfield = peer.Bitfield(msg.Payload)
-		case peer.MsgUnchoke:
-			choked = false
-		case peer.MsgHave:
-			if idx, err := peer.ParseHave(msg.Payload); err == nil {
-				if bitfield == nil {
-					bitfield = peer.NewBitfield(t.Info.NumPieces())
-				}
-				bitfield.SetPiece(int(idx))
-			}
-		}
-		if !choked {
-			break
+// transitionToEndgame activates endgame mode, adding all uncompleted pieces
+// and draining the normal work channel so workers switch to endgame picks.
+func (t *Torrent) transitionToEndgame(ctx *downloadCtx, completed map[int]bool) {
+	for i := 0; i < t.Info.NumPieces(); i++ {
+		if !completed[i] {
+			ctx.endgame.AddPiece(&PieceWork{
+				Index:  i,
+				Hash:   t.Info.Pieces[i],
+				Length: t.Info.PieceSize(i),
+			})
 		}
 	}
-
-	atomic.AddInt32(&t.Stats.ActivePeers, 1)
-	defer atomic.AddInt32(&t.Stats.ActivePeers, -1)
-
-	consecutiveMisses := 0
+	ctx.endgame.Activate()
 	for {
 		select {
-		case <-doneCh:
-			return
+		case <-ctx.workCh:
 		default:
-		}
-
-		// Check if endgame mode is active.
-		var pw *PieceWork
-		inEndgame := false
-		select {
-		case <-egCh:
-			inEndgame = true
-		default:
-		}
-
-		if inEndgame {
-			hasPiece := func(idx int) bool {
-				return bitfield == nil || bitfield.HasPiece(idx)
-			}
-			pw = eg.PickPiece(hasPiece)
-			if pw == nil {
-				return // can't help with remaining pieces
-			}
-		} else {
-			select {
-			case <-doneCh:
-				return
-			case <-egCh:
-				continue // endgame just activated, re-enter loop
-			case p, ok := <-workCh:
-				if !ok {
-					return
-				}
-				pw = p
-			}
-
-			// Check if this peer has the piece.
-			if bitfield != nil && !bitfield.HasPiece(pw.Index) {
-				workCh <- pw
-				consecutiveMisses++
-				if consecutiveMisses >= 15 {
-					return
-				}
-				time.Sleep(time.Duration(consecutiveMisses) * 20 * time.Millisecond)
-				continue
-			}
-			consecutiveMisses = 0
-		}
-
-		result := DownloadPiece(conn, pw)
-
-		if result.Err != nil {
-			if !inEndgame {
-				// Re-queue in normal mode. In endgame, other peers are already trying.
-				workCh <- pw
-			}
-
-			if errors.Is(result.Err, ErrChoked) {
-				if t.waitForUnchoke(conn, &bitfield) {
-					continue
-				}
-			}
-
+			close(ctx.egCh)
 			return
 		}
-
-		resultCh <- result
 	}
 }
 
-// waitForUnchoke blocks until the peer unchokes us or the connection fails.
-// Also processes Have messages to keep the bitfield up to date.
-func (t *Torrent) waitForUnchoke(conn *peer.Conn, bitfield *peer.Bitfield) bool {
-	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
-	for {
-		msg, err := conn.RecvMessage()
-		if err != nil {
-			return false
-		}
-		if msg == nil {
-			continue
-		}
-		switch msg.ID {
-		case peer.MsgUnchoke:
-			return true
-		case peer.MsgHave:
-			if idx, err := peer.ParseHave(msg.Payload); err == nil && *bitfield != nil {
-				bitfield.SetPiece(int(idx))
-			}
-		}
-	}
-}
-
-// FormatBytes formats a byte count as a human-readable string.
-func FormatBytes(b int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case b >= GB:
-		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
-	case b >= MB:
-		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
-	case b >= KB:
-		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
-}

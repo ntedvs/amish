@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -22,6 +23,7 @@ type Display struct {
 	provider StatsProvider
 	name     string
 	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
 // New creates a new Display that reads from the given stats provider.
@@ -35,7 +37,9 @@ func New(provider StatsProvider, torrentName string) *Display {
 
 // Start begins rendering progress to the terminal at the given interval.
 func (d *Display) Start(interval time.Duration) {
+	d.wg.Add(1)
 	go func() {
+		defer d.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -51,9 +55,10 @@ func (d *Display) Start(interval time.Duration) {
 	}()
 }
 
-// Stop signals the display to stop updating.
+// Stop signals the display to stop updating and waits for the final render.
 func (d *Display) Stop() {
 	close(d.done)
+	d.wg.Wait()
 }
 
 // termWidth returns the terminal width, defaulting to 80.
@@ -127,17 +132,32 @@ func TruncateName(name string, maxLen int) string {
 	return name[:maxLen-3] + "..."
 }
 
-// FormatSpeed formats bytes/sec as a human-readable speed string.
-func FormatSpeed(bps float64) string {
+// FormatBytes formats a byte count as a human-readable string.
+func FormatBytes(b int64) string {
 	const (
 		KB = 1024
 		MB = KB * 1024
+		GB = MB * 1024
 	)
 	switch {
-	case bps >= MB:
-		return fmt.Sprintf("%.1f MB/s", bps/MB)
-	case bps >= KB:
-		return fmt.Sprintf("%.1f KB/s", bps/KB)
+	case b >= GB:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+// FormatSpeed formats bytes/sec as a human-readable speed string.
+func FormatSpeed(bps float64) string {
+	switch {
+	case bps >= 1024*1024:
+		return fmt.Sprintf("%.1f MB/s", bps/(1024*1024))
+	case bps >= 1024:
+		return fmt.Sprintf("%.1f KB/s", bps/1024)
 	default:
 		return fmt.Sprintf("%.0f B/s", bps)
 	}

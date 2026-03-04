@@ -116,8 +116,8 @@ func (w *Writer) pieceSegments(index int) []fileSegment {
 		}
 
 		// Calculate the overlapping region.
-		start := max64(pieceStart, fileOffset)
-		end := min64(pieceEnd, fileEnd)
+		start := max(pieceStart, fileOffset)
+		end := min(pieceEnd, fileEnd)
 
 		segments = append(segments, fileSegment{
 			Path:   f.Path,
@@ -156,18 +156,4 @@ func (w *Writer) fileList() []fileEntry {
 		}
 	}
 	return entries
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }
